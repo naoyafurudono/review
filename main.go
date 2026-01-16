@@ -8,13 +8,20 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
+
+	"github.com/creack/pty"
 )
 
 // StreamMessage represents a message from Claude Code's stream-json output
 type StreamMessage struct {
 	Type    string          `json:"type"`
 	Message json.RawMessage `json:"message,omitempty"`
+}
+
+// AssistantStreamMessage represents the assistant stream message wrapper
+type AssistantStreamMessage struct {
+	Type    string           `json:"type"`
+	Message AssistantMessage `json:"message"`
 }
 
 // AssistantMessage represents the assistant's message content
@@ -62,14 +69,21 @@ type Option struct {
 
 // UserResponse represents a response to send back to Claude Code
 type UserResponse struct {
-	Type   string `json:"type"`
-	Answer Answer `json:"answer"`
+	Type    string      `json:"type"`
+	Message UserMessage `json:"message"`
 }
 
-// Answer represents the answer structure
-type Answer struct {
-	ToolUseID string            `json:"tool_use_id"`
-	Answers   map[string]string `json:"answers"`
+// UserMessage represents the user message content
+type UserMessage struct {
+	Role    string       `json:"role"`
+	Content []ToolResult `json:"content"`
+}
+
+// ToolResult represents a tool result to send back
+type ToolResult struct {
+	Type      string `json:"type"`
+	ToolUseID string `json:"tool_use_id"`
+	Content   string `json:"content"`
 }
 
 func main() {
@@ -92,55 +106,47 @@ func run(prompt string) error {
 		"-p", prompt,
 		"--output-format", "stream-json",
 		"--input-format", "stream-json",
+		"--verbose",
+		"--permission-mode", "bypassPermissions",
 	)
 
-	stdin, err := cmd.StdinPipe()
+	// Use PTY to start the command (this handles stdout buffering)
+	ptmx, err := pty.Start(cmd)
 	if err != nil {
-		return fmt.Errorf("failed to get stdin pipe: %w", err)
+		return fmt.Errorf("failed to start command with pty: %w", err)
 	}
+	defer ptmx.Close()
 
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("failed to get stdout pipe: %w", err)
-	}
+	// PTY provides both read (stdout) and write (stdin) on same fd
+	// Process output and send responses through the same PTY
+	processWorkerOutput(ptmx, ptmx)
 
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("failed to get stderr pipe: %w", err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start command: %w", err)
-	}
-
-	var wg sync.WaitGroup
-
-	// Process stderr
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		io.Copy(os.Stderr, stderr)
-	}()
-
-	// Process stdout and handle questions
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		processWorkerOutput(stdout, stdin)
-	}()
-
-	wg.Wait()
 	return cmd.Wait()
 }
 
 func processWorkerOutput(r io.Reader, w io.Writer) {
-	scanner := bufio.NewScanner(r)
-	// Increase buffer size for large JSON messages
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
+	reader := bufio.NewReader(r)
 
-	for scanner.Scan() {
-		line := scanner.Text()
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err != io.EOF {
+				fmt.Fprintf(os.Stderr, "Read error: %v\n", err)
+			}
+			break
+		}
+
+		line = strings.TrimSuffix(line, "\n")
+		line = strings.TrimSuffix(line, "\r")
+
+		if len(line) == 0 {
+			continue
+		}
+
+		// Skip echo of our own input (PTY echoes back what we write)
+		if strings.HasPrefix(line, `{"type":"user_input_result"`) {
+			continue
+		}
 
 		// Try to parse as stream message
 		var msg StreamMessage
@@ -154,35 +160,34 @@ func processWorkerOutput(r io.Reader, w io.Writer) {
 
 		// Check for tool use
 		if msg.Type == "assistant" {
-			var assistant AssistantMessage
-			if err := json.Unmarshal([]byte(line), &assistant); err != nil {
+			var streamMsg AssistantStreamMessage
+			if err := json.Unmarshal([]byte(line), &streamMsg); err != nil {
 				continue
 			}
 
-			for _, content := range assistant.Content {
+			for _, content := range streamMsg.Message.Content {
 				if content.Type == "tool_use" && content.Name == "AskUserQuestion" {
 					var input AskUserQuestionInput
 					if err := json.Unmarshal(content.Input, &input); err != nil {
 						continue
 					}
 
+					// Call reviewer to answer the question
 					answer := askReviewer(&input)
-					response := createResponse(content.ID, answer)
 
+					// Send response back to worker
+					response := createResponse(content.ID, answer)
 					responseJSON, err := json.Marshal(response)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "Failed to marshal response: %v\n", err)
 						continue
 					}
 
-					fmt.Fprintln(w, string(responseJSON))
+					// Write response followed by newline
+					w.Write([]byte(string(responseJSON) + "\n"))
 				}
 			}
 		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "Scanner error: %v\n", err)
 	}
 }
 
@@ -244,11 +249,24 @@ func askReviewer(input *AskUserQuestionInput) map[string]string {
 }
 
 func createResponse(toolUseID string, answers map[string]string) UserResponse {
+	// Format the answer as a simple string (e.g., "q0: 1")
+	var parts []string
+	for k, v := range answers {
+		parts = append(parts, fmt.Sprintf("%s: %s", k, v))
+	}
+	content := strings.Join(parts, ", ")
+
 	return UserResponse{
-		Type: "user_input_result",
-		Answer: Answer{
-			ToolUseID: toolUseID,
-			Answers:   answers,
+		Type: "user",
+		Message: UserMessage{
+			Role: "user",
+			Content: []ToolResult{
+				{
+					Type:      "tool_result",
+					ToolUseID: toolUseID,
+					Content:   content,
+				},
+			},
 		},
 	}
 }
